@@ -8,6 +8,7 @@
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf-lib/1.17.1/pdf-lib.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
 <style>
   :root{
     --paper:#e9edf1;
@@ -166,6 +167,20 @@
     border-top:1px dashed var(--err);margin-top:4px;padding-top:7px;
   }
 
+  /* opts */
+  .opts{
+    margin-top:20px;background:var(--card);border:1px solid var(--line-soft);
+    border-radius:12px;padding:6px 4px;box-shadow:var(--shadow);
+  }
+  .optrow{display:flex;gap:12px;align-items:flex-start;padding:12px 14px;cursor:pointer}
+  .optrow input{margin-top:3px;width:17px;height:17px;accent-color:var(--accent);cursor:pointer;flex:0 0 auto}
+  .optmain b{font-size:14.5px;font-weight:600}
+  .optmain small{display:block;color:var(--muted);font-size:12.5px;margin-top:3px;line-height:1.5}
+  .qrow{
+    display:flex;align-items:center;gap:10px;padding:0 14px 13px 43px;flex-wrap:wrap;
+  }
+  .qlab{font-size:12.5px;color:var(--muted);font-family:"IBM Plex Mono",monospace}
+
   /* action */
   .action{
     position:sticky;bottom:16px;margin-top:26px;
@@ -236,6 +251,24 @@
   <div class="list" id="list"></div>
   <div class="empty hidden" id="empty">Nenhum arquivo ainda.</div>
 
+  <div class="opts hidden" id="opts">
+    <label class="optrow">
+      <input type="checkbox" id="raster">
+      <span class="optmain">
+        <b>Modo impressora</b> — converte cada página em imagem
+        <small>Ligue se a impressora recusar o arquivo unificado (comum com muitos PDFs). Fica compatível com qualquer impressora, mas o arquivo cresce e o texto deixa de ser selecionável.</small>
+      </span>
+    </label>
+    <div class="qrow hidden" id="qrow">
+      <span class="qlab">Qualidade:</span>
+      <div class="seg" id="dpi">
+        <button data-d="150">Rápida</button>
+        <button data-d="200" class="on">Boa</button>
+        <button data-d="300">Alta (nítida)</button>
+      </div>
+    </div>
+  </div>
+
   <div class="action hidden" id="action">
     <div class="status" id="status">Pronto para unir na ordem cronológica.</div>
     <button class="btn" id="go" disabled>
@@ -256,10 +289,17 @@ const $ = s => document.querySelector(s);
 const drop=$('#drop'), fileInput=$('#file'), listEl=$('#list'), emptyEl=$('#empty');
 const barEl=$('#bar'), actionEl=$('#action'), goBtn=$('#go'), statusEl=$('#status');
 const nEl=$('#n'), pgEl=$('#pg'), seg=$('#seg');
+const optsEl=$('#opts'), rasterChk=$('#raster'), qrow=$('#qrow'), dpiSeg=$('#dpi');
 
 let entries = [];      // {id, file, ts, name, size, pages, err}
 let order = 'asc';
 let idSeq = 0;
+let rasterize = false;
+let dpi = 200;
+
+if(window.pdfjsLib){
+  pdfjsLib.GlobalWorkerOptions.workerSrc='https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+}
 
 /* ---------- helpers ---------- */
 const pad=(v,n=2)=>String(v).padStart(n,'0');
@@ -321,6 +361,7 @@ function render(){
   const has=entries.length>0;
   emptyEl.classList.toggle('hidden',has);
   barEl.classList.toggle('hidden',!has);
+  optsEl.classList.toggle('hidden',!has);
   actionEl.classList.toggle('hidden',!has);
 
   const rows=sorted();
@@ -368,17 +409,40 @@ function render(){
 function escapeHtml(s){return s.replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
 
 /* ---------- merge ---------- */
+const tick=()=>new Promise(r=>setTimeout(r,0));
+
 async function merge(){
   const rows=sorted().filter(e=>!e.err);
   if(!rows.length) return;
   goBtn.disabled=true;
-  $('#golabel').textContent='Unindo…';
   goBtn.querySelector('svg').outerHTML='<div class="spin"></div>';
   statusEl.className='status';
+  let res;
+  try{
+    res = rasterize ? await rasterizeMerge(rows) : await textMerge(rows);
+  }catch(err){
+    statusEl.textContent='Falha ao gerar o PDF: '+((err&&err.message)?err.message:err);
+    statusEl.className='status er';
+    resetGo(); return;
+  }
+  if(!res || res.pageCount===0){
+    statusEl.textContent='Nenhuma página pôde ser unida.';
+    statusEl.className='status er';
+    resetGo(); return;
+  }
+  downloadBytes(res.bytes);
+  statusEl.textContent=`Pronto! ${res.pageCount} páginas unidas${res.failed.length?` · ${res.failed.length} arquivo(s) falharam`:''}${rasterize?' · modo impressora':''}. Download iniciado.`;
+  statusEl.className='status ok';
+  resetGo();
+}
+
+// modo normal: mantém texto selecionável, arquivo leve
+async function textMerge(rows){
   const out=await PDFDocument.create();
   let done=0, failed=[];
   for(const e of rows){
     statusEl.textContent=`Processando ${++done}/${rows.length}: ${e.name}`;
+    await tick();
     try{
       const buf=await e.file.arrayBuffer();
       const src=await PDFDocument.load(buf,{ignoreEncryption:true, updateMetadata:false});
@@ -386,15 +450,54 @@ async function merge(){
       pages.forEach(p=>out.addPage(p));
     }catch(err){ failed.push(e.name); }
   }
-  if(out.getPageCount()===0){
-    statusEl.textContent='Nenhuma página pôde ser unida.';
-    statusEl.className='status er';
-    resetGo(); return;
-  }
-  out.setProducer('Unir PDFs');
-  out.setCreator('Unir PDFs');
-  // useObjectStreams:false -> tabela de referencia classica, compativel com impressoras
+  out.setProducer('Unir PDFs'); out.setCreator('Unir PDFs');
   const bytes=await out.save({ useObjectStreams:false });
+  return {bytes, pageCount:out.getPageCount(), failed};
+}
+
+// modo impressora: cada página vira imagem achatada -> compatível com qualquer impressora
+async function rasterizeMerge(rows){
+  if(!window.pdfjsLib) throw new Error('componente de rasterização não carregou (verifique a internet).');
+  const scale=dpi/72;
+  const out=await PDFDocument.create();
+  let failed=[], di=0;
+  for(const e of rows){
+    di++;
+    let pdf;
+    try{
+      const buf=await e.file.arrayBuffer();
+      pdf=await pdfjsLib.getDocument({data:new Uint8Array(buf), standardFontDataUrl:'https://unpkg.com/pdfjs-dist@3.11.174/standard_fonts/'}).promise;
+    }catch(err){ failed.push(e.name); continue; }
+    for(let i=1;i<=pdf.numPages;i++){
+      statusEl.textContent=`Rasterizando arquivo ${di}/${rows.length} · página ${i}/${pdf.numPages}`;
+      await tick();
+      const page=await pdf.getPage(i);
+      const viewport=page.getViewport({scale});
+      const canvas=document.createElement('canvas');
+      canvas.width=Math.max(1,Math.round(viewport.width));
+      canvas.height=Math.max(1,Math.round(viewport.height));
+      const ctx=canvas.getContext('2d',{alpha:false});
+      ctx.fillStyle='#ffffff'; ctx.fillRect(0,0,canvas.width,canvas.height);
+      await page.render({canvasContext:ctx, viewport, background:'#ffffff'}).promise;
+      const blob=await new Promise(r=>canvas.toBlob(r,'image/jpeg',0.82));
+      const bytes=new Uint8Array(await blob.arrayBuffer());
+      const img=await out.embedJpg(bytes);
+      const pw=canvas.width*72/dpi, ph=canvas.height*72/dpi;
+      const pg=out.addPage([pw,ph]);
+      pg.drawImage(img,{x:0,y:0,width:pw,height:ph});
+      canvas.width=0; canvas.height=0;
+      if(page.cleanup) page.cleanup();
+    }
+    if(pdf.destroy) await pdf.destroy();
+  }
+  out.setProducer('Unir PDFs'); out.setCreator('Unir PDFs');
+  statusEl.textContent='Finalizando o arquivo…';
+  await tick();
+  const bytes=await out.save({ useObjectStreams:false });
+  return {bytes, pageCount:out.getPageCount(), failed};
+}
+
+function downloadBytes(bytes){
   const blob=new Blob([bytes],{type:'application/pdf'});
   const url=URL.createObjectURL(blob);
   const a=document.createElement('a');
@@ -403,9 +506,6 @@ async function merge(){
   a.download=`unificado_${now.getFullYear()}${pad(now.getMonth()+1)}${pad(now.getDate())}_${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}.pdf`;
   a.click();
   setTimeout(()=>URL.revokeObjectURL(url),4000);
-  statusEl.textContent=`Pronto! ${out.getPageCount()} páginas unidas${failed.length?` · ${failed.length} arquivo(s) falharam`:''}. Download iniciado.`;
-  statusEl.className='status ok';
-  resetGo();
 }
 function resetGo(){
   const spin=goBtn.querySelector('.spin');
@@ -428,6 +528,11 @@ seg.querySelectorAll('button').forEach(b=>b.onclick=()=>{
   order=b.dataset.o;
   seg.querySelectorAll('button').forEach(x=>x.classList.toggle('on',x===b));
   render();
+});
+rasterChk.onchange=()=>{ rasterize=rasterChk.checked; qrow.classList.toggle('hidden',!rasterize); };
+dpiSeg.querySelectorAll('button').forEach(b=>b.onclick=()=>{
+  dpi=+b.dataset.d;
+  dpiSeg.querySelectorAll('button').forEach(x=>x.classList.toggle('on',x===b));
 });
 $('#clear').onclick=clearAll;
 goBtn.onclick=merge;
