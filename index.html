@@ -391,7 +391,10 @@ async function merge(){
     statusEl.className='status er';
     resetGo(); return;
   }
-  const bytes=await out.save();
+  out.setProducer('Unir PDFs');
+  out.setCreator('Unir PDFs');
+  // useObjectStreams:false -> tabela de referencia classica, compativel com impressoras
+  const bytes=await out.save({ useObjectStreams:false });
   const blob=new Blob([bytes],{type:'application/pdf'});
   const url=URL.createObjectURL(blob);
   const a=document.createElement('a');
